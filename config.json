@@ -4,7 +4,7 @@
     {"name": "public.provided_ip",   "key_columns": ["ip_address", "company_id"], "sync_column": "created_at"},
     {"name": "public.provided_domain",   "key_columns": ["domain_address", "company_id"], "sync_column": "created_at"},
     {"name": "public.provided_email",   "key_columns": ["email", "company_id"], "sync_column": "created_at"},
-    {"name": "public.report",   "key_columns": ["scan_date", "company_id"], "sync_column": "created_at"},
+    {"name": "public.report",   "key_columns": ["company_id", "created_at"], "sync_column": "created_at"},
     {"name": "public.report_ip",   "key_columns": ["report_id", "ip_address", "host_name","port_number"], "sync_column": "created_at"},
     {"name": "public.report_subdomain",   "key_columns": ["report_ip_id", "sub_domain_ssl"], "sync_column": "created_at"},
     {"name": "public.encrypt_protocol",   "key_columns": ["name"], "sync_column": "created_at"},

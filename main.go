@@ -277,11 +277,16 @@ func (im *IDMapping) translateSourceIDToTargetID(sourceID int64) int64 {
 	// Get key values for this source ID
 	keyValues, exists := im.sourceIDToKeyValues[sourceID]
 	if !exists {
+		log.Printf("Debug: No source mapping found for sourceID=%d", sourceID)
 		return 0
 	}
 
+	log.Printf("Debug: Found source mapping for sourceID=%d -> keyValues=%v", sourceID, keyValues)
+
 	// Look up target ID using key values
-	return im.lookupTargetID(keyValues)
+	targetID := im.lookupTargetID(keyValues)
+	log.Printf("Debug: lookupTargetID returned targetID=%d for keyValues=%v", targetID, keyValues)
+	return targetID
 }
 
 // loadSourceIDMapping loads source ID to key values mapping for FK translation
@@ -352,7 +357,7 @@ func loadSourceIDMapping(ctx context.Context, source *pgxpool.Pool, tableName st
 }
 
 // updateIDMappingWithInsertedRecords updates the ID mapping cache with newly inserted records
-func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Pool, tableName string, keyColumns []string, insertedIDs []int64, originalRows [][]any, originalCols []string, idCache IDMappingCache) {
+func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Pool, tableName string, keyColumns []string, insertedIDs []int64, originalRows [][]any, originalCols []string, translatedRows [][]any, translatedCols []string, idCache IDMappingCache) {
 	if len(insertedIDs) == 0 {
 		return
 	}
@@ -371,28 +376,16 @@ func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Poo
 		return
 	}
 
-	// Get key column indices
+	// Get key column indices from translated columns (excluding ID columns)
 	keyColIndices := make([]int, 0, len(keyColumns))
 	for _, keyCol := range keyColumns {
-		for i, col := range originalCols {
+		for i, col := range translatedCols {
 			if strings.EqualFold(col, keyCol) && !isPrimaryKeyColumn(col) {
 				keyColIndices = append(keyColIndices, i)
 				break
 			}
 		}
 	}
-
-	// Query target database to get the key values for the inserted IDs
-	schema, name := splitTable(tableName)
-	keyList := strings.Join(quoteCols(keyColumns), ", ")
-	q := fmt.Sprintf(`SELECT id, %s FROM %s.%s WHERE id = ANY($1)`, keyList, pq(schema), pq(name))
-
-	rows, err := target.Query(ctx, q, insertedIDs)
-	if err != nil {
-		log.Printf("Warning: Failed to query inserted records for mapping update in %s: %v", tableName, err)
-		return
-	}
-	defer rows.Close()
 
 	// Update the mapping cache
 	mapping := idCache[tableName]
@@ -402,40 +395,56 @@ func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Poo
 	}
 
 	updatedCount := 0
-	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
-			log.Printf("Warning: Failed to scan inserted record for mapping update: %v", err)
+	// Match inserted IDs with rows by order
+	// The insertedIDs array is in the same order as the rows were inserted
+	for i, targetID := range insertedIDs {
+		if i >= len(originalRows) || i >= len(translatedRows) {
+			log.Printf("Warning: Index %d out of bounds for rows in %s", i, tableName)
+			break
+		}
+
+		originalRow := originalRows[i]
+		translatedRow := translatedRows[i]
+
+		if idColIdx >= len(originalRow) {
+			log.Printf("Warning: ID column index out of bounds for row %d in %s", i, tableName)
 			continue
 		}
 
-		if len(vals) < len(keyColumns)+1 {
-			continue
-		}
-
-		targetID, ok := vals[0].(int64)
+		// Get source ID from original row
+		sourceIDRaw := originalRow[idColIdx]
+		sourceID, ok := sourceIDRaw.(int64)
 		if !ok {
 			// Try different integer types
-			switch v := vals[0].(type) {
+			switch v := sourceIDRaw.(type) {
 			case int32:
-				targetID = int64(v)
+				sourceID = int64(v)
 			case int:
-				targetID = int64(v)
+				sourceID = int64(v)
 			default:
+				log.Printf("Warning: Could not convert source ID for row %d in %s: %T", i, tableName, sourceIDRaw)
 				continue
 			}
 		}
 
-		keyValues := vals[1:]
+		// Extract key values from translated row (excluding ID columns)
+		// This is important because the translated row contains the FK values that were actually inserted
+		keyValues := make([]any, 0, len(keyColIndices))
+		for _, keyIdx := range keyColIndices {
+			if keyIdx < len(translatedRow) {
+				keyValues = append(keyValues, translatedRow[keyIdx])
+			}
+		}
+
+		// Update source ID to key values mapping for reverse lookup
+		mapping.sourceIDToKeyValues[sourceID] = keyValues
+
+		// Update key hash to target ID mapping
 		keyHash := buildKeyHash(keyValues)
 		mapping.mapping[keyHash] = targetID
 		updatedCount++
 
-		log.Printf("Updated mapping for %s: key_hash=%s -> target_id=%d", tableName, keyHash, targetID)
-	}
-
-	if rows.Err() != nil {
-		log.Printf("Warning: Error reading inserted records for mapping update: %v", rows.Err())
+		log.Printf("Updated mapping for %s: source_id=%d -> target_id=%d (key_hash=%s)", tableName, sourceID, targetID, keyHash)
 	}
 
 	log.Printf("Updated %d mappings for %s with newly inserted records", updatedCount, tableName)
@@ -445,24 +454,135 @@ func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Poo
 func buildIDMappingCache(ctx context.Context, source *pgxpool.Pool, target *pgxpool.Pool, tables []TableConfig) (IDMappingCache, error) {
 	cache := make(IDMappingCache)
 
+	// First pass: Load all target mappings
 	for _, table := range tables {
-		// Load target mapping (key values -> target ID)
 		mapping, err := loadIDMapping(ctx, target, table.Name, table.KeyColumns)
 		if err != nil {
 			return nil, fmt.Errorf("load target ID mapping for %s: %v", table.Name, err)
 		}
+		cache[table.Name] = mapping
+	}
 
-		// Load source mapping (source ID -> key values)
+	// Sort tables by dependency order (tables with no FK deps first)
+	orderedTables := orderTablesByDependencies(tables)
+
+	// Second pass: Load source mappings in dependency order and apply FK translation
+	for _, table := range orderedTables {
 		sourceMapping, err := loadSourceIDMapping(ctx, source, table.Name, table.KeyColumns)
 		if err != nil {
 			return nil, fmt.Errorf("load source ID mapping for %s: %v", table.Name, err)
 		}
 
-		mapping.sourceIDToKeyValues = sourceMapping
-		cache[table.Name] = mapping
+		// Apply FK translation to source key values
+		translatedSourceMapping := make(map[int64][]any)
+		for sourceID, keyValues := range sourceMapping {
+			// Translate FK values in key columns
+			translatedKeyValues := make([]any, len(keyValues))
+			copy(translatedKeyValues, keyValues)
+
+			log.Printf("Debug cache build: Table %s, sourceID=%d, original keyValues=%v", table.Name, sourceID, keyValues)
+
+			// Check each key column for FK translation
+			for i, keyCol := range table.KeyColumns {
+				if i >= len(translatedKeyValues) {
+					continue
+				}
+
+				log.Printf("Debug cache build: Checking key column %s (index %d) for FK translation: isForeignKeyColumn=%t", keyCol, i, isForeignKeyColumn(keyCol))
+
+				if isForeignKeyColumn(keyCol) {
+					// Get the original FK value
+					log.Printf("Debug cache build: FK value type for %s: %T, value: %v", keyCol, translatedKeyValues[i], translatedKeyValues[i])
+					var fkValue int64
+					var ok bool
+					// Handle both int32 and int64 types
+					switch v := translatedKeyValues[i].(type) {
+					case int64:
+						fkValue = v
+						ok = true
+					case int32:
+						fkValue = int64(v)
+						ok = true
+					case int:
+						fkValue = int64(v)
+						ok = true
+					}
+
+					if ok {
+						log.Printf("Debug cache build: Translating FK %s=%d in table %s", keyCol, fkValue, table.Name)
+						// Determine referenced table
+						var referencedTable string
+						refTableName := strings.TrimSuffix(strings.ToLower(keyCol), "_id")
+						switch refTableName {
+						case "company":
+							referencedTable = "public.company"
+						case "report":
+							referencedTable = "public.report"
+						case "report_ip":
+							referencedTable = "public.report_ip"
+						default:
+							// Try to find matching table
+							for tableName := range cache {
+								if strings.Contains(strings.ToLower(tableName), refTableName) {
+									referencedTable = tableName
+									break
+								}
+							}
+						}
+
+						log.Printf("Debug cache build: Referenced table for %s is %s", keyCol, referencedTable)
+
+						// Translate FK if referenced table exists in cache and has source mapping
+						if referencedTable != "" {
+							if refMapping, exists := cache[referencedTable]; exists && refMapping.sourceIDToKeyValues != nil {
+								if targetID := refMapping.translateSourceIDToTargetID(fkValue); targetID > 0 {
+									log.Printf("Debug cache build: Translated %s: %d -> %d", keyCol, fkValue, targetID)
+									translatedKeyValues[i] = targetID
+								} else {
+									log.Printf("Debug cache build: Translation failed for %s=%d", keyCol, fkValue)
+								}
+							} else {
+								log.Printf("Debug cache build: No mapping found for referenced table %s or source mapping not yet built", referencedTable)
+							}
+						}
+					}
+				}
+			}
+			log.Printf("Debug cache build: Table %s, sourceID=%d, translated keyValues=%v", table.Name, sourceID, translatedKeyValues)
+			translatedSourceMapping[sourceID] = translatedKeyValues
+		}
+
+		cache[table.Name].sourceIDToKeyValues = translatedSourceMapping
 	}
 
 	return cache, nil
+}
+
+// orderTablesByDependencies sorts tables so that tables with no FK dependencies come first
+func orderTablesByDependencies(tables []TableConfig) []TableConfig {
+	// Simple heuristic: put tables without FK columns first
+	var independent []TableConfig
+	var dependent []TableConfig
+
+	for _, table := range tables {
+		hasFKCols := false
+		for _, keyCol := range table.KeyColumns {
+			if isForeignKeyColumn(keyCol) {
+				hasFKCols = true
+				break
+			}
+		}
+
+		if hasFKCols {
+			dependent = append(dependent, table)
+		} else {
+			independent = append(independent, table)
+		}
+	}
+
+	// Return independent tables first, then dependent ones
+	result := append(independent, dependent...)
+	return result
 }
 
 func ensureMetaTable(ctx context.Context, target *pgxpool.Pool) error {
@@ -965,8 +1085,8 @@ func main() {
 				// Update ID mapping cache with actual inserted IDs
 				if len(insertResult.InsertedIDs) > 0 {
 					// For each inserted ID, we need to map it back to the source ID
-					// This requires matching the inserted records with original source records
-					updateIDMappingWithInsertedRecords(ctx, tp, t.Name, t.KeyColumns, insertResult.InsertedIDs, originalSub, batchResult.OriginalCols, idCache)
+					// Pass both original and translated data to correlate source IDs with translated key values
+					updateIDMappingWithInsertedRecords(ctx, tp, t.Name, t.KeyColumns, insertResult.InsertedIDs, originalSub, batchResult.OriginalCols, filteredSub, batchResult.InsertCols, idCache)
 				}
 
 				// Use original rows for timestamp calculation
@@ -1001,6 +1121,8 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: could not reload mapping for %s: %v", t.Name, err)
 		} else {
+			// Preserve the updated sourceIDToKeyValues mapping from cache
+			// Don't overwrite it with old data - updateIDMappingWithInsertedRecords already updated it
 			updatedMapping.sourceIDToKeyValues = idCache[t.Name].sourceIDToKeyValues
 			idCache[t.Name] = updatedMapping
 			log.Printf("Reloaded mapping for %s: %d target entries", t.Name, len(updatedMapping.mapping))
