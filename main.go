@@ -351,6 +351,96 @@ func loadSourceIDMapping(ctx context.Context, source *pgxpool.Pool, tableName st
 	return sourceMapping, nil
 }
 
+// updateIDMappingWithInsertedRecords updates the ID mapping cache with newly inserted records
+func updateIDMappingWithInsertedRecords(ctx context.Context, target *pgxpool.Pool, tableName string, keyColumns []string, insertedIDs []int64, originalRows [][]any, originalCols []string, idCache IDMappingCache) {
+	if len(insertedIDs) == 0 {
+		return
+	}
+
+	// Find the ID column index in original columns
+	idColIdx := -1
+	for i, col := range originalCols {
+		if isPrimaryKeyColumn(col) {
+			idColIdx = i
+			break
+		}
+	}
+
+	if idColIdx == -1 {
+		log.Printf("Warning: No ID column found in %s for mapping update", tableName)
+		return
+	}
+
+	// Get key column indices
+	keyColIndices := make([]int, 0, len(keyColumns))
+	for _, keyCol := range keyColumns {
+		for i, col := range originalCols {
+			if strings.EqualFold(col, keyCol) && !isPrimaryKeyColumn(col) {
+				keyColIndices = append(keyColIndices, i)
+				break
+			}
+		}
+	}
+
+	// Query target database to get the key values for the inserted IDs
+	schema, name := splitTable(tableName)
+	keyList := strings.Join(quoteCols(keyColumns), ", ")
+	q := fmt.Sprintf(`SELECT id, %s FROM %s.%s WHERE id = ANY($1)`, keyList, pq(schema), pq(name))
+
+	rows, err := target.Query(ctx, q, insertedIDs)
+	if err != nil {
+		log.Printf("Warning: Failed to query inserted records for mapping update in %s: %v", tableName, err)
+		return
+	}
+	defer rows.Close()
+
+	// Update the mapping cache
+	mapping := idCache[tableName]
+	if mapping == nil {
+		log.Printf("Warning: No mapping found for table %s", tableName)
+		return
+	}
+
+	updatedCount := 0
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			log.Printf("Warning: Failed to scan inserted record for mapping update: %v", err)
+			continue
+		}
+
+		if len(vals) < len(keyColumns)+1 {
+			continue
+		}
+
+		targetID, ok := vals[0].(int64)
+		if !ok {
+			// Try different integer types
+			switch v := vals[0].(type) {
+			case int32:
+				targetID = int64(v)
+			case int:
+				targetID = int64(v)
+			default:
+				continue
+			}
+		}
+
+		keyValues := vals[1:]
+		keyHash := buildKeyHash(keyValues)
+		mapping.mapping[keyHash] = targetID
+		updatedCount++
+
+		log.Printf("Updated mapping for %s: key_hash=%s -> target_id=%d", tableName, keyHash, targetID)
+	}
+
+	if rows.Err() != nil {
+		log.Printf("Warning: Error reading inserted records for mapping update: %v", rows.Err())
+	}
+
+	log.Printf("Updated %d mappings for %s with newly inserted records", updatedCount, tableName)
+}
+
 // buildIDMappingCache creates ID mapping cache for all referenced tables
 func buildIDMappingCache(ctx context.Context, source *pgxpool.Pool, target *pgxpool.Pool, tables []TableConfig) (IDMappingCache, error) {
 	cache := make(IDMappingCache)
@@ -596,15 +686,30 @@ func fetchBatch(ctx context.Context, src *pgxpool.Pool, table string, cols []str
 	}, nil
 }
 
-// insertBatch inserts rows with ON CONFLICT (keyColumns...) DO NOTHING.
-func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []string, keyColumns []string, rowsVals [][]any, dryRun bool) (int64, time.Time, error) {
+// InsertResult contains information about inserted records
+type InsertResult struct {
+	RowsAffected int64
+	InsertedIDs  []int64 // Only for tables with ID columns
+}
+
+// insertBatch inserts rows with proper error logging and ID tracking.
+func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []string, keyColumns []string, rowsVals [][]any, dryRun bool) (*InsertResult, time.Time, error) {
 	if len(rowsVals) == 0 {
-		return 0, time.Time{}, nil
+		return &InsertResult{}, time.Time{}, nil
 	}
 	// Build INSERT statement with multi-row values.
 	schema, name := splitTable(table)
 	colList := strings.Join(quoteCols(cols), ", ")
 	conflict := strings.Join(quoteCols(keyColumns), ", ")
+
+	// Check if table has ID column for RETURNING clause
+	hasIDCol := false
+	for _, col := range cols {
+		if isPrimaryKeyColumn(col) {
+			hasIDCol = true
+			break
+		}
+	}
 
 	// Build placeholders ($1...$N) for each row.
 	var (
@@ -622,23 +727,66 @@ func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []st
 		placeholders = append(placeholders, fmt.Sprintf("(%s)", strings.Join(ph, ", ")))
 	}
 
-	q := fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO NOTHING;`,
-		pq(schema), pq(name), colList, strings.Join(placeholders, ", "), conflict)
+	// Build query with RETURNING clause if table has ID
+	var q string
+	if hasIDCol {
+		q = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO NOTHING RETURNING id;`,
+			pq(schema), pq(name), colList, strings.Join(placeholders, ", "), conflict)
+	} else {
+		q = fmt.Sprintf(`INSERT INTO %s.%s (%s) VALUES %s ON CONFLICT (%s) DO NOTHING;`,
+			pq(schema), pq(name), colList, strings.Join(placeholders, ", "), conflict)
+	}
 
 	if dryRun {
 		log.Printf("DRY_RUN insert %d rows into %s.%s", len(rowsVals), schema, name)
-		return int64(len(rowsVals)), time.Time{}, nil
+		if hasIDCol {
+			log.Printf("DRY_RUN query: %s", q)
+		}
+		return &InsertResult{RowsAffected: int64(len(rowsVals))}, time.Time{}, nil
 	}
 
-	ct, err := dst.Exec(ctx, q, args...)
-	if err != nil {
-		return 0, time.Time{}, err
+	result := &InsertResult{}
+
+	if hasIDCol {
+		// Execute with RETURNING to get actual inserted IDs
+		rows, err := dst.Query(ctx, q, args...)
+		if err != nil {
+			log.Printf("ERROR inserting into %s.%s: %v", schema, name, err)
+			log.Printf("Failed query: %s", q)
+			return nil, time.Time{}, fmt.Errorf("insert into %s.%s failed: %v", schema, name, err)
+		}
+		defer rows.Close()
+
+		var insertedIDs []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				log.Printf("ERROR scanning inserted ID from %s.%s: %v", schema, name, err)
+				return nil, time.Time{}, fmt.Errorf("scan inserted ID failed: %v", err)
+			}
+			insertedIDs = append(insertedIDs, id)
+		}
+		if rows.Err() != nil {
+			log.Printf("ERROR reading inserted IDs from %s.%s: %v", schema, name, rows.Err())
+			return nil, time.Time{}, fmt.Errorf("read inserted IDs failed: %v", rows.Err())
+		}
+
+		result.RowsAffected = int64(len(insertedIDs))
+		result.InsertedIDs = insertedIDs
+		log.Printf("Successfully inserted %d rows into %s.%s with IDs: %v", len(insertedIDs), schema, name, insertedIDs)
+	} else {
+		// Execute without RETURNING for tables without ID
+		ct, err := dst.Exec(ctx, q, args...)
+		if err != nil {
+			log.Printf("ERROR inserting into %s.%s: %v", schema, name, err)
+			log.Printf("Failed query: %s", q)
+			return nil, time.Time{}, fmt.Errorf("insert into %s.%s failed: %v", schema, name, err)
+		}
+		result.RowsAffected = ct.RowsAffected()
+		log.Printf("Successfully inserted %d rows into %s.%s (no ID tracking)", result.RowsAffected, schema, name)
 	}
 
-	// Determine max sync timestamp from the batch (last row by our fetch order)
-	// We don't know which column index is the sync column; compute it from cols list.
-	// The caller guarantees rowsVals are ordered by syncCol ascending.
-	return ct.RowsAffected(), time.Time{}, nil
+	return result, time.Time{}, nil
 }
 
 // maxSyncTs scans rows to get the maximum value of sync column by name.
@@ -760,7 +908,6 @@ func main() {
 		}
 		log.Printf("last_sync_ts: %s", lastTs.Format(time.RFC3339))
 
-
 		cols, err := getAllColumns(ctx, sp, t.Name)
 		if err != nil {
 			log.Fatalf("discover columns for %s: %v", t.Name, err)
@@ -809,11 +956,18 @@ func main() {
 					}
 				}
 
-				inserted, _, err := insertBatch(ctx, tp, t.Name, batchResult.InsertCols, filteredKeyColumns, filteredSub, dryRun)
+				insertResult, _, err := insertBatch(ctx, tp, t.Name, batchResult.InsertCols, filteredKeyColumns, filteredSub, dryRun)
 				if err != nil {
 					log.Fatalf("insert batch into %s: %v", t.Name, err)
 				}
-				totalInserted += inserted
+				totalInserted += insertResult.RowsAffected
+
+				// Update ID mapping cache with actual inserted IDs
+				if len(insertResult.InsertedIDs) > 0 {
+					// For each inserted ID, we need to map it back to the source ID
+					// This requires matching the inserted records with original source records
+					updateIDMappingWithInsertedRecords(ctx, tp, t.Name, t.KeyColumns, insertResult.InsertedIDs, originalSub, batchResult.OriginalCols, idCache)
+				}
 
 				// Use original rows for timestamp calculation
 				ts, err := maxSyncTs(originalSub, batchResult.OriginalCols, t.SyncColumn)
@@ -850,6 +1004,13 @@ func main() {
 			updatedMapping.sourceIDToKeyValues = idCache[t.Name].sourceIDToKeyValues
 			idCache[t.Name] = updatedMapping
 			log.Printf("Reloaded mapping for %s: %d target entries", t.Name, len(updatedMapping.mapping))
+
+			// Debug: show some mappings for verification
+			if len(updatedMapping.mapping) <= 10 {
+				for keyHash, targetID := range updatedMapping.mapping {
+					log.Printf("  Target mapping: key_hash=%s -> target_id=%d", keyHash, targetID)
+				}
+			}
 		}
 	}
 
