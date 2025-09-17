@@ -1,0 +1,22 @@
+{
+  "tables": [
+    {"name": "public.company", "key_columns": ["company_name"], "sync_column": "created_at"},
+    {"name": "public.provided_ip",   "key_columns": ["ip_address", "company_id"], "sync_column": "created_at"},
+    {"name": "public.provided_domain",   "key_columns": ["domain_address", "company_id"], "sync_column": "created_at"},
+    {"name": "public.provided_email",   "key_columns": ["email", "company_id"], "sync_column": "created_at"},
+    {"name": "public.report",   "key_columns": ["created_at", "company_id"], "sync_column": "created_at"},
+    {"name": "public.report_ip",   "key_columns": ["report_id", "ip_address", "host_name","port_number"], "sync_column": "created_at"},
+    {"name": "public.report_subdomain",   "key_columns": ["report_ip_id", "sub_domain_ssl"], "sync_column": "created_at"},
+    {"name": "public.encrypt_protocol",   "key_columns": ["name"], "sync_column": "created_at"},
+    {"name": "public.encryptProt_reportIp",   "key_columns": ["report_ip_id", "encrypt_protocol_id"], "sync_column": "created_at"},
+    {"name": "public.vulnerability",   "key_columns": ["name"] , "sync_column": "created_at"},
+    {"name": "public.vulnerability_reportIp",   "key_columns": ["report_ip_id", "vulnerability_id"] , "sync_column": "created_at"},
+    {"name": "public.report_ssl",   "key_columns": ["report_id", "serial_number"] , "sync_column": "created_at"},
+    {"name": "public.report_email",   "key_columns": ["report_id", "email"] , "sync_column": "created_at"},
+    {"name": "public.search_loc",   "key_columns": ["loc_name", "loc_date_from", "loc_date_to"] , "sync_column": "created_at"},
+    {"name": "public.report_email_loc",   "key_columns": ["report_email_id", "search_loc_id"] , "sync_column": "created_at"},
+    {"name": "public.leak",   "key_columns": ["leak_name", "leak_date"] , "sync_column": "created_at"},
+    {"name": "public.report_leak_email",   "key_columns": ["report_email_id", "leak_id"] , "sync_column": "created_at"},
+    {"name": "public.report_alike_domain",   "key_columns": ["report_id", "domain", "ip_address"] , "sync_column": "created_at"}
+  ]
+}

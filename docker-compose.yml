@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  syncsvc:
+    build: .
+    environment:
+      SOURCE_DSN: "postgres://scoutUser:scoutPass@localhost:5433/scanner?sslmode=disable"
+      TARGET_DSN: "postgres://scoutUser:scoutPass@localhost:5433/scout?sslmode=disable"
+      CONFIG_PATH: "./config.json"
+      BATCH_SIZE: "1000"
+      DRY_RUN: "false"
+      RESET_SYNC: "${RESET_SYNC:-false}"
+    volumes:
+      - ./config.json:/home/appuser/config.json:ro
+    network_mode: "host"
+    restart: "no"  # Run once and exit
+
