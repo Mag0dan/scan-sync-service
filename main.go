@@ -693,7 +693,7 @@ type InsertResult struct {
 }
 
 // insertBatch inserts rows with proper error logging and ID tracking.
-func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []string, keyColumns []string, rowsVals [][]any, dryRun bool) (*InsertResult, time.Time, error) {
+func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []string, keyColumns []string, rowsVals [][]any, originalCols []string, dryRun bool) (*InsertResult, time.Time, error) {
 	if len(rowsVals) == 0 {
 		return &InsertResult{}, time.Time{}, nil
 	}
@@ -702,9 +702,9 @@ func insertBatch(ctx context.Context, dst *pgxpool.Pool, table string, cols []st
 	colList := strings.Join(quoteCols(cols), ", ")
 	conflict := strings.Join(quoteCols(keyColumns), ", ")
 
-	// Check if table has ID column for RETURNING clause
+	// Check if table has ID column for RETURNING clause (use original columns, not filtered ones)
 	hasIDCol := false
-	for _, col := range cols {
+	for _, col := range originalCols {
 		if isPrimaryKeyColumn(col) {
 			hasIDCol = true
 			break
@@ -956,7 +956,7 @@ func main() {
 					}
 				}
 
-				insertResult, _, err := insertBatch(ctx, tp, t.Name, batchResult.InsertCols, filteredKeyColumns, filteredSub, dryRun)
+				insertResult, _, err := insertBatch(ctx, tp, t.Name, batchResult.InsertCols, filteredKeyColumns, filteredSub, batchResult.OriginalCols, dryRun)
 				if err != nil {
 					log.Fatalf("insert batch into %s: %v", t.Name, err)
 				}
